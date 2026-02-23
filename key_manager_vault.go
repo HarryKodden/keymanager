@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type VaultKeyManager struct {
 // NewVaultKeyManager creates a new VaultKeyManager. The caller must configure
 // VAULT_ADDR and provide a token, or pass a configured vault.Client.
 func NewVaultKeyManager(client *vault.Client, transitMount string) *VaultKeyManager {
+	log.Printf("[KEYMANAGER][VAULT] initialized vault key manager (mount=%s)", transitMount)
 	return &VaultKeyManager{client: client, transitMount: transitMount}
 }
 
@@ -51,6 +53,7 @@ func (v *VaultKeyManager) GetJWKS() (map[string]interface{}, error) {
 		}
 	}
 
+	log.Printf("[KEYMANAGER][VAULT] fetching JWKS for %d keys", len(keys))
 	jwkKeys := make([]map[string]interface{}, 0, len(keys))
 	for _, name := range keys {
 		sec, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.transitMount, name))
@@ -93,6 +96,7 @@ func (v *VaultKeyManager) GetJWKS() (map[string]interface{}, error) {
 }
 
 func (v *VaultKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
+	log.Printf("[KEYMANAGER][VAULT] Sign requested for kid=%s", kid)
 	name := kid
 	if idx := strings.Index(kid, "-"); idx != -1 {
 		name = kid[:idx]
@@ -127,6 +131,7 @@ func (v *VaultKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	sig := make([]byte, keyBytes*2)
 	copy(sig[keyBytes-len(rb):keyBytes], rb)
 	copy(sig[2*keyBytes-len(sb):], sb)
+	log.Printf("[KEYMANAGER][VAULT] Sign completed for kid=%s via vault key=%s", kid, name)
 	return sig, nil
 }
 
@@ -140,6 +145,13 @@ func (v *VaultKeyManager) GenerateKey(name string, kty string, alg string) (*Key
 	if err != nil {
 		return nil, err
 	}
+	if kty == "" {
+		kty = "EC"
+	}
+	if alg == "" {
+		alg = "ES256"
+	}
+	log.Printf("[KEYMANAGER][VAULT] generated key %s (type=%s kty=%s alg=%s)", name, vtype, kty, alg)
 	return &KeyMetadata{Kid: name, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}, nil
 }
 
@@ -148,6 +160,7 @@ func (v *VaultKeyManager) RotateKey(name string) (*KeyMetadata, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("[KEYMANAGER][VAULT] rotated key %s", name)
 	return &KeyMetadata{Kid: name, Status: KeyStatusActive, CreatedAt: time.Now().UTC()}, nil
 }
 
@@ -168,6 +181,7 @@ func (v *VaultKeyManager) ListKeys() ([]*KeyMetadata, error) {
 			}
 		}
 	}
+	log.Printf("[KEYMANAGER][VAULT] listing %d keys", len(out))
 	return out, nil
 }
 
@@ -176,6 +190,7 @@ func (v *VaultKeyManager) RevokeKey(kid string) error {
 	if idx := strings.Index(kid, "-"); idx != -1 {
 		name = kid[:idx]
 	}
+	log.Printf("[KEYMANAGER][VAULT] revoking key %s (vault name=%s)", kid, name)
 	cfgPath := fmt.Sprintf("%s/keys/%s/config", v.transitMount, name)
 	_, _ = v.client.Logical().Write(cfgPath, map[string]interface{}{"deletion_allowed": true})
 	delPath := fmt.Sprintf("%s/keys/%s", v.transitMount, name)
@@ -197,10 +212,12 @@ func (v *VaultKeyManager) GetSigningKey(kid string) (interface{}, error) {
 	if idx := strings.Index(kid, "-"); idx != -1 {
 		name = kid[:idx]
 	}
+	log.Printf("[KEYMANAGER][VAULT] GetSigningKey lookup for kid=%s -> vault name=%s", kid, name)
 	return name, nil
 }
 
 func (v *VaultKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
+	log.Printf("[KEYMANAGER][VAULT] signing key announcement oldKid=%s", oldKid)
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()
 	payload := map[string]interface{}{"iss": iss, "iat": now.Unix(), "exp": now.Add(exp).Unix(), "jwks": map[string]interface{}{"keys": []interface{}{newJWK}}}
@@ -224,5 +241,6 @@ func (v *VaultKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, old
 }
 
 func (v *VaultKeyManager) ImportKey(name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
+	log.Printf("[KEYMANAGER][VAULT] ImportKey not implemented for VaultKeyManager")
 	return nil, fmt.Errorf("ImportKey not implemented for VaultKeyManager")
 }

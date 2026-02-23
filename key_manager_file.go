@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,8 @@ func NewFileKeyManager(dir string, passphrase string) *FileKeyManager {
 	if dir == "" {
 		dir = "./keys"
 	}
+	log.Printf("[KEYMANAGER][FILE] loading keys from %s", dir)
+
 	return &FileKeyManager{dir: dir, passphrase: passphrase, keys: make(map[string]*ecdsa.PrivateKey), meta: make(map[string]*KeyMetadata)}
 }
 
@@ -136,7 +139,11 @@ func (f *FileKeyManager) saveKeyToDisk(kid string, priv *ecdsa.PrivateKey, meta 
 		return err
 	}
 	fname := filepath.Join(f.dir, kid+".key.json")
-	return ioutil.WriteFile(fname, out, 0600)
+	if err := ioutil.WriteFile(fname, out, 0600); err != nil {
+		return err
+	}
+	log.Printf("[KEYMANAGER][FILE] saved key %s to %s", kid, fname)
+	return nil
 }
 
 func (f *FileKeyManager) GetSigningKey(kid string) (interface{}, error) {
@@ -165,6 +172,7 @@ func (f *FileKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	priv, ok := f.keys[kid]
 	f.mu.RUnlock()
 	if !ok {
+		log.Printf("[KEYMANAGER][FILE] Sign: key not found %s", kid)
 		return nil, fmt.Errorf("key %s not found", kid)
 	}
 	h := sha256.Sum256(payload)
@@ -177,6 +185,7 @@ func (f *FileKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	sig := make([]byte, 64)
 	copy(sig[32-len(rb):32], rb)
 	copy(sig[64-len(sb):], sb)
+	log.Printf("[KEYMANAGER][FILE] signing with key %s", kid)
 	return sig, nil
 }
 
@@ -186,7 +195,13 @@ func (f *FileKeyManager) GenerateKey(name string, kty string, alg string) (*KeyM
 		return nil, err
 	}
 	kid := fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405Z"))
-	meta := &KeyMetadata{Kid: kid, Kty: "EC", Alg: "ES256", Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
+	if kty == "" {
+		kty = "EC"
+	}
+	if alg == "" {
+		alg = "ES256"
+	}
+	meta := &KeyMetadata{Kid: kid, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
 	f.mu.Lock()
 	f.keys[kid] = priv
 	f.meta[kid] = meta
@@ -194,6 +209,7 @@ func (f *FileKeyManager) GenerateKey(name string, kty string, alg string) (*KeyM
 	if err := f.saveKeyToDisk(kid, priv, meta); err != nil {
 		return nil, err
 	}
+	log.Printf("[KEYMANAGER][FILE] generated key %s (kty=%s alg=%s)", kid, kty, alg)
 	return meta, nil
 }
 
@@ -208,6 +224,7 @@ func (f *FileKeyManager) ListKeys() ([]*KeyMetadata, error) {
 	for _, md := range f.meta {
 		out = append(out, md)
 	}
+	log.Printf("[KEYMANAGER][FILE] listing %d keys", len(out))
 	return out, nil
 }
 

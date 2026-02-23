@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ type MemoryKeyManager struct {
 }
 
 func NewMemoryKeyManager() *MemoryKeyManager {
+	log.Printf("[KEYMANAGER][MEMORY] initialized ephemeral memory key manager")
 	return &MemoryKeyManager{keys: make(map[string]*ecdsa.PrivateKey), meta: make(map[string]*KeyMetadata)}
 }
 
@@ -31,6 +33,7 @@ func (m *MemoryKeyManager) GetSigningKey(kid string) (interface{}, error) {
 	if k, ok := m.keys[kid]; ok {
 		return k, nil
 	}
+	log.Printf("[KEYMANAGER][MEMORY] signing key not found: %s", kid)
 	return nil, fmt.Errorf("signing key %s not found", kid)
 }
 
@@ -43,6 +46,7 @@ func (m *MemoryKeyManager) GetJWKS() (map[string]interface{}, error) {
 		y := base64.RawURLEncoding.EncodeToString(pk.PublicKey.Y.Bytes())
 		keys = append(keys, map[string]interface{}{"kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256", "x": x, "y": y})
 	}
+	log.Printf("[KEYMANAGER][MEMORY] returning JWKS with %d keys", len(keys))
 	return map[string]interface{}{"keys": keys}, nil
 }
 
@@ -50,7 +54,9 @@ func (m *MemoryKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	m.mu.RLock()
 	k, ok := m.keys[kid]
 	m.mu.RUnlock()
+	log.Printf("[KEYMANAGER][MEMORY] Sign requested using kid=%s", kid)
 	if !ok {
+		log.Printf("[KEYMANAGER][MEMORY] Sign: key not found %s", kid)
 		return nil, fmt.Errorf("key %s not found", kid)
 	}
 	h := sha256.Sum256(payload)
@@ -63,6 +69,7 @@ func (m *MemoryKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	sig := make([]byte, 64)
 	copy(sig[32-len(rb):32], rb)
 	copy(sig[64-len(sb):], sb)
+	log.Printf("[KEYMANAGER][MEMORY] Sign completed for kid=%s", kid)
 	return sig, nil
 }
 
@@ -72,10 +79,17 @@ func (m *MemoryKeyManager) GenerateKey(name string, kty string, alg string) (*Ke
 		return nil, err
 	}
 	kid := fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405Z"))
+	if kty == "" {
+		kty = "EC"
+	}
+	if alg == "" {
+		alg = "ES256"
+	}
 	m.mu.Lock()
 	m.keys[kid] = priv
-	m.meta[kid] = &KeyMetadata{Kid: kid, Kty: "EC", Alg: "ES256", Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
+	m.meta[kid] = &KeyMetadata{Kid: kid, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
 	m.mu.Unlock()
+	log.Printf("[KEYMANAGER][MEMORY] generated key %s (kty=%s alg=%s)", kid, kty, alg)
 	return m.meta[kid], nil
 }
 
@@ -90,6 +104,7 @@ func (m *MemoryKeyManager) ListKeys() ([]*KeyMetadata, error) {
 	for _, md := range m.meta {
 		out = append(out, md)
 	}
+	log.Printf("[KEYMANAGER][MEMORY] listing %d keys", len(out))
 	return out, nil
 }
 
@@ -98,12 +113,15 @@ func (m *MemoryKeyManager) RevokeKey(kid string) error {
 	defer m.mu.Unlock()
 	if md, ok := m.meta[kid]; ok {
 		md.Status = KeyStatusRetired
+		log.Printf("[KEYMANAGER][MEMORY] revoked key %s", kid)
 		return nil
 	}
+	log.Printf("[KEYMANAGER][MEMORY] revoke unknown key %s", kid)
 	return fmt.Errorf("unknown key %s", kid)
 }
 
 func (m *MemoryKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
+	log.Printf("[KEYMANAGER][MEMORY] signing key announcement oldKid=%s", oldKid)
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()
 	payload := map[string]interface{}{"iss": iss, "iat": now.Unix(), "exp": now.Add(exp).Unix(), "jwks": map[string]interface{}{"keys": []interface{}{newJWK}}}
@@ -121,6 +139,7 @@ func (m *MemoryKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, ol
 }
 
 func (m *MemoryKeyManager) ImportKey(name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
+	log.Printf("[KEYMANAGER][MEMORY] ImportKey not implemented for MemoryKeyManager")
 	return nil, fmt.Errorf("ImportKey not implemented for MemoryKeyManager")
 }
 

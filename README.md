@@ -16,15 +16,36 @@ Lightweight key management utilities used by the OpenID Federation resolver and 
 
 From the repository root use the module normally; the package provides a Go API.
 
-Example (create file-backed manager):
+The package exposes a helper `NewDefaultKeyManager()` which selects an appropriate
+backend based on environment variables (see "Backends & configuration" below).
+
+Example (preferred: let the keymanager choose):
 
 ```go
 import "github.com/harrykodden/keymanager"
 
-km := keymanager.NewFileKeyManager("./keys", "")
+km, err := keymanager.NewDefaultKeyManager()
+if err != nil {
+	// handle error
+}
 _ = km.LoadKeys()
 md, err := km.GenerateKey("resolver", "EC", "ES256")
 _ = md
+```
+
+If you need to explicitly construct a backend, you can still use the concrete
+constructors:
+
+```go
+// file-backed
+km := keymanager.NewFileKeyManager("./keys", "my-passphrase")
+
+// in-memory (ephemeral)
+km := keymanager.NewMemoryKeyManager()
+
+// vault (requires vault client)
+// vc := vault.NewClient(cfg)
+// km := keymanager.NewVaultKeyManager(vc, "transit")
 ```
 
 ## Running tests
@@ -38,6 +59,37 @@ go test ./keymanager -v
 ## CI
 
 This repository uses GitHub Actions to run `gofmt`, `go vet`, and `go test`. The badge above points to the workflow at `.github/workflows/ci.yml` in the main repository. If you add or change workflows, update that path accordingly.
+
+## Backends & configuration
+
+`NewDefaultKeyManager()` selects the backend by inspecting environment variables in this order:
+
+- Vault: If both `VAULT_ADDR` and `VAULT_TOKEN` are set, the factory will create a `VaultKeyManager` and use the Transit engine (mount name from `VAULT_TRANSIT_MOUNT`, default `transit`).
+- File: If `KEYS_DIR` and `PASSPHRASE` are set (and Vault is not configured), the factory will create a `FileKeyManager` storing encrypted key blobs under `KEYS_DIR`.
+- Memory: Otherwise the factory returns a `MemoryKeyManager` (ephemeral keys only).
+
+Set environment variables before starting the resolver or any application that calls `NewDefaultKeyManager()` to control the backend. Examples:
+
+Vault (Transit):
+
+```bash
+export VAULT_ADDR=https://vault.example:8200
+export VAULT_TOKEN=s.Xxx...
+export VAULT_TRANSIT_MOUNT=transit   # optional
+```
+
+File-backed:
+
+```bash
+export KEYS_DIR=/var/lib/myapp/keys
+export PASSPHRASE="correct horse battery staple"
+```
+
+Memory (default):
+
+```bash
+unset VAULT_ADDR VAULT_TOKEN KEYS_DIR PASSPHRASE
+```
 
 ## Contributing
 
