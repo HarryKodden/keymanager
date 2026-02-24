@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
 	"math/big"
@@ -309,5 +310,97 @@ func TestFileKeyManager_PKCS8(t *testing.T) {
 	}
 	if _, err := f2.Sign(ctx, im.Kid, []byte("payload-pkcs8")); err != nil {
 		t.Fatalf("Sign failed after load: %v", err)
+	}
+}
+
+func TestMemoryRevokeZeroEC(t *testing.T) {
+	m := NewMemoryKeyManager()
+	md, err := m.GenerateKey(context.Background(), "test-ec", "EC", "ES256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid := md.Kid
+	m.mu.RLock()
+	privIfc, ok := m.keys[kid]
+	m.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected key in memory manager")
+	}
+	ep, ok := privIfc.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatalf("expected ecdsa private key, got %T", privIfc)
+	}
+	if ep.D.Sign() == 0 {
+		t.Fatalf("unexpected zero D before revoke")
+	}
+	if err := m.RevokeKey(context.Background(), kid); err != nil {
+		t.Fatal(err)
+	}
+	if ep.D.Sign() != 0 {
+		t.Fatalf("expected D to be zeroed after revoke")
+	}
+}
+
+func TestMemoryRevokeZeroRSA(t *testing.T) {
+	m := NewMemoryKeyManager()
+	md, err := m.GenerateKey(context.Background(), "test-rsa", "RSA", "RS256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid := md.Kid
+	m.mu.RLock()
+	privIfc, ok := m.keys[kid]
+	m.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected key in memory manager")
+	}
+	rp, ok := privIfc.(*rsa.PrivateKey)
+	if !ok {
+		t.Fatalf("expected rsa private key, got %T", privIfc)
+	}
+	if rp.D.Sign() == 0 {
+		t.Fatalf("unexpected zero D before revoke")
+	}
+	if err := m.RevokeKey(context.Background(), kid); err != nil {
+		t.Fatal(err)
+	}
+	if rp.D.Sign() != 0 {
+		t.Fatalf("expected D to be zeroed after revoke")
+	}
+}
+
+func TestECDSADERToRawZeroing(t *testing.T) {
+	// create a DER-encoded ecdsa signature
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := make([]byte, 32)
+	if _, err := rand.Read(h); err != nil {
+		t.Fatal(err)
+	}
+	r, s, err := ecdsa.Sign(rand.Reader, priv, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derBytes, err := asn1.Marshal(struct{ R, S *big.Int }{r, s})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// copy into mutable buffer
+	der := make([]byte, len(derBytes))
+	copy(der, derBytes)
+	out, err := ECDSADERToRaw(der, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 64 {
+		t.Fatalf("unexpected raw signature length: %d", len(out))
+	}
+	// expect der buffer to be zeroed
+	for i, b := range der {
+		if b != 0 {
+			t.Fatalf("expected der[%d] to be zeroed", i)
+		}
 	}
 }

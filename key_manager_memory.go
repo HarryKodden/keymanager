@@ -155,6 +155,10 @@ func (m *MemoryKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	defer m.mu.Unlock()
 	if md, ok := m.meta[kid]; ok {
 		md.Status = KeyStatusRetired
+		if priv, ok2 := m.keys[kid]; ok2 {
+			zeroPrivateKey(priv)
+			delete(m.keys, kid)
+		}
 		log.Printf("[KEYMANAGER][MEMORY] revoked key %s", kid)
 		return nil
 	}

@@ -48,5 +48,59 @@ func ECDSADERToRaw(der []byte, keyBytes int) ([]byte, error) {
 	if _, err := asn1.Unmarshal(der, &esig); err != nil {
 		return nil, err
 	}
+	// zero DER input as it's sensitive
+	for i := range der {
+		der[i] = 0
+	}
 	return ecdsaRSStoRaw(esig.R, esig.S, keyBytes), nil
+}
+
+// zeroPrivateKey attempts to overwrite sensitive big.Int fields inside a
+// private key structure to reduce the time secret material remains in memory.
+func zeroPrivateKey(priv interface{}) {
+	switch k := priv.(type) {
+	case *rsa.PrivateKey:
+		if k.D != nil {
+			k.D.SetInt64(0)
+		}
+		for i := range k.Primes {
+			if k.Primes[i] != nil {
+				k.Primes[i].SetInt64(0)
+			}
+		}
+		// zero precomputed values
+		if k.Precomputed.Dp != nil {
+			k.Precomputed.Dp.SetInt64(0)
+		}
+		if k.Precomputed.Dq != nil {
+			k.Precomputed.Dq.SetInt64(0)
+		}
+		if k.Precomputed.Qinv != nil {
+			k.Precomputed.Qinv.SetInt64(0)
+		}
+		for i := range k.Precomputed.CRTValues {
+			v := &k.Precomputed.CRTValues[i]
+			if v.Exp != nil {
+				v.Exp.SetInt64(0)
+			}
+			if v.Coeff != nil {
+				v.Coeff.SetInt64(0)
+			}
+			if v.R != nil {
+				v.R.SetInt64(0)
+			}
+		}
+	case *ecdsa.PrivateKey:
+		if k.D != nil {
+			k.D.SetInt64(0)
+		}
+		if k.X != nil {
+			k.X.SetInt64(0)
+		}
+		if k.Y != nil {
+			k.Y.SetInt64(0)
+		}
+	default:
+		// nothing we can do generically
+	}
 }

@@ -105,9 +105,13 @@ func (v *VaultKeyManager) Sign(ctx context.Context, kid string, payload []byte) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode vault signature: %w", err)
 	}
-	// convert DER ECDSA signature to raw r||s
+	// convert DER ECDSA signature to raw r||s (ECDSADERToRaw zeros DER input)
 	sig, err := ECDSADERToRaw(der, 32)
 	if err != nil {
+		// zero der on error
+		for i := range der {
+			der[i] = 0
+		}
 		return nil, fmt.Errorf("failed to convert ecdsa der->raw: %w", err)
 	}
 	log.Printf("[KEYMANAGER][VAULT] Sign completed for kid=%s via vault key=%s", kid, name)

@@ -54,6 +54,15 @@ func deriveKey(pass string) []byte {
 	return h[:]
 }
 
+func zeroBytes(b []byte) {
+	if b == nil {
+		return
+	}
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 func (f *FileKeyManager) LoadKeys(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -99,6 +108,9 @@ func (f *FileKeyManager) LoadKeys(ctx context.Context) error {
 		}
 		plain, err := gcm.Open(nil, nonce, ct, nil)
 		if err != nil {
+			// zero ciphertext/nonce on error
+			zeroBytes(ct)
+			zeroBytes(nonce)
 			continue
 		}
 		var privIfc interface{}
@@ -110,8 +122,16 @@ func (f *FileKeyManager) LoadKeys(ctx context.Context) error {
 		} else if p, err := x509.ParseECPrivateKey(plain); err == nil {
 			privIfc = p
 		} else {
+			// zero plaintext and continue
+			zeroBytes(plain)
+			zeroBytes(ct)
+			zeroBytes(nonce)
 			continue
 		}
+		// zero sensitive buffers after parsing
+		zeroBytes(plain)
+		zeroBytes(ct)
+		zeroBytes(nonce)
 		f.keys[blob.Kid] = privIfc
 		f.meta[blob.Kid] = &KeyMetadata{Kid: blob.Kid, Kty: blob.Kty, Alg: blob.Alg, Status: blob.Status, CreatedAt: blob.CreatedAt}
 	}
@@ -130,28 +150,46 @@ func (f *FileKeyManager) saveKeyToDisk(kid string, priv interface{}, meta *KeyMe
 		return fmt.Errorf("failed to marshal private key to PKCS#8: %w", err)
 	}
 	key := deriveKey(f.passphrase)
+	defer zeroBytes(key)
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
+		zeroBytes(der)
 		return err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
+		zeroBytes(der)
 		return err
 	}
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
+		zeroBytes(der)
 		return err
 	}
 	ct := gcm.Seal(nil, nonce, der, nil)
 	blob := fileKeyBlob{Kid: kid, Kty: meta.Kty, Alg: meta.Alg, Status: meta.Status, CreatedAt: meta.CreatedAt, Nonce: base64.StdEncoding.EncodeToString(nonce), Data: base64.StdEncoding.EncodeToString(ct)}
 	out, err := json.MarshalIndent(blob, "", "  ")
 	if err != nil {
+		zeroBytes(der)
+		zeroBytes(ct)
+		zeroBytes(nonce)
 		return err
 	}
 	fname := filepath.Join(f.dir, kid+".key.json")
 	if err := ioutil.WriteFile(fname, out, 0600); err != nil {
+		zeroBytes(der)
+		zeroBytes(ct)
+		zeroBytes(nonce)
 		return err
 	}
+	// enforce file perms
+	_ = os.Chmod(fname, 0600)
+
+	// zero sensitive buffers as soon as possible
+	zeroBytes(der)
+	zeroBytes(ct)
+	zeroBytes(nonce)
 	log.Printf("[KEYMANAGER][FILE] saved key %s to %s", kid, fname)
 	return nil
 }
