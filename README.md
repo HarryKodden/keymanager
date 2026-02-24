@@ -1,56 +1,30 @@
+
 # Key Manager
 
 ![Go](https://img.shields.io/badge/go-1.25-blue.svg)
 ![CI](https://github.com/harrykodden/keymanager/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 
-Lightweight key management utilities used by the OpenID Federation resolver and related components.
-
-## Purpose
-
-- Provide in-memory and file-backed key storage implementations.
-- Offer key lifecycle operations (generate, rotate, list, revoke) and signing helpers.
-- Expose JWKS for publishing public keys.
-
-## Quick Start
-
-From the repository root use the module normally; the package provides a Go API.
-
-The package exposes a helper `NewDefaultKeyManager()` which selects an appropriate
-backend based on environment variables (see "Backends & configuration" below).
-
-Example (preferred: let the keymanager choose):
-
-```go
-````markdown
-# Key Manager
-
-![Go](https://img.shields.io/badge/go-1.25-blue.svg)
-![CI](https://github.com/harrykodden/keymanager/actions/workflows/ci.yml/badge.svg)
-![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
-
-Lightweight key management utilities used by the OpenID Federation resolver and related components.
+Lightweight Go utilities for key management used by the OpenID Federation resolver and related components.
 
 ## Purpose
 
 - Provide `Memory`, `File`, and `Vault (transit)` key storage implementations.
-- Offer key lifecycle operations: `GenerateKey`, `RotateKey`, `ActivateKey`, `DeactivateKey`, `RevokeKey` and `ListKeys`.
-- Signing support (`Sign`) for `ES256` (ECDSA P-256) and `RS256` (RSA).
-- JWKS emission and import/persistence helpers (File manager persists encrypted PKCS#8 blobs).
+- Offer key lifecycle operations: `GenerateKey`, `RotateKey`, `ActivateKey`, `DeactivateKey`, `RevokeKey`, and `ListKeys`.
+- Signing support for `ES256` (ECDSA P-256) and `RS256` (RSA) via `Sign`.
+- JWKS emission and key import/persistence helpers (the File manager persists encrypted PKCS#8 blobs).
 
-## Highlights / New features
+## Highlights
 
 - All public APIs accept `context.Context` for cancellation and tracing.
-- Typed errors exported: `ErrKeyNotFound`, `ErrKeyNotActive`, `ErrUnsupportedOperation`.
-- `GenerateKey` now defaults to `standby` status; use `ActivateKey` or `GenerateAndActivate` to make active.
-- RSA support added (generate, sign, JWKS). RSA private keys are persisted as PKCS#8.
-- Centralized helpers for JWKS and signatures (`jwkFromPublicKey`, `SignPayload`, `ECDSADERToRaw`).
-- File-backed key storage encrypts key blobs with AES-GCM derived from the provided passphrase.
-- Configurable RSA bits: set `KEYMANAGER_RSA_BITS` env var (default: 2048).
+- Typed errors: `ErrKeyNotFound`, `ErrKeyNotActive`, `ErrUnsupportedOperation`.
+- `GenerateKey` defaults to `standby`; use `ActivateKey` or `GenerateAndActivate` to make a key active.
+- RSA support (generate, sign, JWKS) and configurable RSA size via `KEYMANAGER_RSA_BITS` (default: 2048).
+- File-backed key storage encrypts PKCS#8 blobs with AES-GCM derived from the provided passphrase.
 
-## Quick Start
+## Quick start
 
-Preferred: use the factory which selects a backend based on env vars:
+Prefer using the factory which selects a backend based on environment variables:
 
 ```go
 import (
@@ -61,41 +35,42 @@ import (
 ctx := context.Background()
 km, err := keymanager.NewDefaultKeyManager()
 if err != nil {
-	// handle
+	// handle error
 }
 _ = km.LoadKeys(ctx)
 
-// generate a key (standby) and then activate it
 md, err := km.GenerateAndActivate(ctx, "resolver", "EC", "ES256")
-_ = md
+if err != nil {
+	// handle
+}
 
-// sign a payload
 sig, err := km.Sign(ctx, md.Kid, []byte("payload-to-sign"))
 _ = sig
 
-// get JWKS to publish
 jwks, err := km.GetJWKS(ctx)
 _ = jwks
 ```
 
-Constructing backends directly:
+Construct backends directly when required:
 
 ```go
-// file-backed (persisted, encrypted PKCS#8 blobs)
+// File-backed (persisted, encrypted PKCS#8 blobs)
 f := keymanager.NewFileKeyManager("./keys", "my-passphrase")
 _ = f.LoadKeys(ctx)
 
-// in-memory (ephemeral)
+// In-memory (ephemeral)
 m := keymanager.NewMemoryKeyManager()
 
-// vault (transit) - requires a configured Vault client
+// Vault (transit) - requires a configured Vault client
 // vc := vault.NewClient(cfg)
 // v := keymanager.NewVaultKeyManager(vc, "transit")
 ```
 
-## Importing keys (PKCS#8 and legacy formats)
+## Importing keys
 
-`FileKeyManager.ImportKey(ctx, name, pemBytes, passphrase)` accepts PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) as well as RSA (`-----BEGIN RSA PRIVATE KEY-----`) and EC (`-----BEGIN EC PRIVATE KEY-----`) PEM formats.
+`FileKeyManager.ImportKey(ctx, name, pemBytes, passphrase)`
+
+accepts PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`), as well as PKCS#1 RSA PEM (`-----BEGIN RSA PRIVATE KEY-----`) and SEC1 EC PEM (`-----BEGIN EC PRIVATE KEY-----`) formats.
 
 Example (PKCS#8 RSA import):
 
@@ -105,15 +80,15 @@ meta, err := f.ImportKey(ctx, "imported", rsaKeyPem, "")
 _ = meta
 ```
 
-## Configuration & Environment
+## Configuration & environment
 
-- `KEYMANAGER_RSA_BITS` — optional. Default RSA key size used for programmatically generated RSA keys. Example: `export KEYMANAGER_RSA_BITS=4096`.
+- `KEYMANAGER_RSA_BITS` — default RSA key size for generated RSA keys (e.g., `export KEYMANAGER_RSA_BITS=4096`).
 - `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_TRANSIT_MOUNT` — when set, `NewDefaultKeyManager()` will prefer Vault Transit.
 - `KEYS_DIR`, `PASSPHRASE` — used to enable `FileKeyManager` when Vault is not configured.
 
 ## Examples
 
-- Generate + activate and sign with `FileKeyManager`:
+Generate, activate, and sign with `FileKeyManager`:
 
 ```go
 ctx := context.Background()
@@ -124,7 +99,7 @@ sig, _ := f.Sign(ctx, md.Kid, []byte("hello"))
 fmt.Printf("sig len=%d\n", len(sig))
 ```
 
-- Export JWKS (publishable JSON):
+Export JWKS (publishable JSON):
 
 ```go
 jwks, _ := f.GetJWKS(ctx)
@@ -148,5 +123,3 @@ go test ./... -v
 ## License
 
 This project is licensed under the Apache License, Version 2.0. See the `LICENSE` file at the project root for the full text.
-
-````
