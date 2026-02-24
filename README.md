@@ -22,73 +22,122 @@ backend based on environment variables (see "Backends & configuration" below).
 Example (preferred: let the keymanager choose):
 
 ```go
-import "github.com/harrykodden/keymanager"
+````markdown
+# Key Manager
 
-km, err := keymanager.NewDefaultKeyManager()
-if err != nil {
-	// handle error
-}
-_ = km.LoadKeys()
-md, err := km.GenerateKey("resolver", "EC", "ES256")
-_ = md
-```
+![Go](https://img.shields.io/badge/go-1.25-blue.svg)
+![CI](https://github.com/harrykodden/keymanager/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 
-If you need to explicitly construct a backend, you can still use the concrete
-constructors:
+Lightweight key management utilities used by the OpenID Federation resolver and related components.
+
+## Purpose
+
+- Provide `Memory`, `File`, and `Vault (transit)` key storage implementations.
+- Offer key lifecycle operations: `GenerateKey`, `RotateKey`, `ActivateKey`, `DeactivateKey`, `RevokeKey` and `ListKeys`.
+- Signing support (`Sign`) for `ES256` (ECDSA P-256) and `RS256` (RSA).
+- JWKS emission and import/persistence helpers (File manager persists encrypted PKCS#8 blobs).
+
+## Highlights / New features
+
+- All public APIs accept `context.Context` for cancellation and tracing.
+- Typed errors exported: `ErrKeyNotFound`, `ErrKeyNotActive`, `ErrUnsupportedOperation`.
+- `GenerateKey` now defaults to `standby` status; use `ActivateKey` or `GenerateAndActivate` to make active.
+- RSA support added (generate, sign, JWKS). RSA private keys are persisted as PKCS#8.
+- Centralized helpers for JWKS and signatures (`jwkFromPublicKey`, `SignPayload`, `ECDSADERToRaw`).
+- File-backed key storage encrypts key blobs with AES-GCM derived from the provided passphrase.
+- Configurable RSA bits: set `KEYMANAGER_RSA_BITS` env var (default: 2048).
+
+## Quick Start
+
+Preferred: use the factory which selects a backend based on env vars:
 
 ```go
-// file-backed
-km := keymanager.NewFileKeyManager("./keys", "my-passphrase")
+import (
+	"context"
+	"github.com/harrykodden/keymanager"
+)
+
+ctx := context.Background()
+km, err := keymanager.NewDefaultKeyManager()
+if err != nil {
+	// handle
+}
+_ = km.LoadKeys(ctx)
+
+// generate a key (standby) and then activate it
+md, err := km.GenerateAndActivate(ctx, "resolver", "EC", "ES256")
+_ = md
+
+// sign a payload
+sig, err := km.Sign(ctx, md.Kid, []byte("payload-to-sign"))
+_ = sig
+
+// get JWKS to publish
+jwks, err := km.GetJWKS(ctx)
+_ = jwks
+```
+
+Constructing backends directly:
+
+```go
+// file-backed (persisted, encrypted PKCS#8 blobs)
+f := keymanager.NewFileKeyManager("./keys", "my-passphrase")
+_ = f.LoadKeys(ctx)
 
 // in-memory (ephemeral)
-km := keymanager.NewMemoryKeyManager()
+m := keymanager.NewMemoryKeyManager()
 
-// vault (requires vault client)
+// vault (transit) - requires a configured Vault client
 // vc := vault.NewClient(cfg)
-// km := keymanager.NewVaultKeyManager(vc, "transit")
+// v := keymanager.NewVaultKeyManager(vc, "transit")
 ```
 
-## Running tests
+## Importing keys (PKCS#8 and legacy formats)
 
-Run tests from repository root (or inside `keymanager`):
+`FileKeyManager.ImportKey(ctx, name, pemBytes, passphrase)` accepts PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) as well as RSA (`-----BEGIN RSA PRIVATE KEY-----`) and EC (`-----BEGIN EC PRIVATE KEY-----`) PEM formats.
 
-```bash
-go test ./keymanager -v
+Example (PKCS#8 RSA import):
+
+```go
+rsaKeyPem := /* PEM bytes containing a PKCS#8 PRIVATE KEY */
+meta, err := f.ImportKey(ctx, "imported", rsaKeyPem, "")
+_ = meta
 ```
 
-## CI
+## Configuration & Environment
 
-This repository uses GitHub Actions to run `gofmt`, `go vet`, and `go test`. The badge above points to the workflow at `.github/workflows/ci.yml` in the main repository. If you add or change workflows, update that path accordingly.
+- `KEYMANAGER_RSA_BITS` — optional. Default RSA key size used for programmatically generated RSA keys. Example: `export KEYMANAGER_RSA_BITS=4096`.
+- `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_TRANSIT_MOUNT` — when set, `NewDefaultKeyManager()` will prefer Vault Transit.
+- `KEYS_DIR`, `PASSPHRASE` — used to enable `FileKeyManager` when Vault is not configured.
 
-## Backends & configuration
+## Examples
 
-`NewDefaultKeyManager()` selects the backend by inspecting environment variables in this order:
+- Generate + activate and sign with `FileKeyManager`:
 
-- Vault: If both `VAULT_ADDR` and `VAULT_TOKEN` are set, the factory will create a `VaultKeyManager` and use the Transit engine (mount name from `VAULT_TRANSIT_MOUNT`, default `transit`).
-- File: If `KEYS_DIR` and `PASSPHRASE` are set (and Vault is not configured), the factory will create a `FileKeyManager` storing encrypted key blobs under `KEYS_DIR`.
-- Memory: Otherwise the factory returns a `MemoryKeyManager` (ephemeral keys only).
-
-Set environment variables before starting the resolver or any application that calls `NewDefaultKeyManager()` to control the backend. Examples:
-
-Vault (Transit):
-
-```bash
-export VAULT_ADDR=https://vault.example:8200
-export VAULT_TOKEN=s.Xxx...
-export VAULT_TRANSIT_MOUNT=transit   # optional
+```go
+ctx := context.Background()
+f := keymanager.NewFileKeyManager("./keys", "s3cr3t-pass")
+_ = f.LoadKeys(ctx)
+md, _ := f.GenerateAndActivate(ctx, "app", "RSA", "RS256")
+sig, _ := f.Sign(ctx, md.Kid, []byte("hello"))
+fmt.Printf("sig len=%d\n", len(sig))
 ```
 
-File-backed:
+- Export JWKS (publishable JSON):
 
-```bash
-export KEYS_DIR=/var/lib/myapp/keys
-export PASSPHRASE="correct horse battery staple"
+```go
+jwks, _ := f.GetJWKS(ctx)
+// encode to JSON when serving over HTTP
 ```
 
-Memory (default):
+## Testing
+
+Run unit tests:
 
 ```bash
-unset VAULT_ADDR VAULT_TOKEN KEYS_DIR PASSPHRASE
+gofmt -w .
+go test ./... -v
 ```
 
 ## Contributing
@@ -100,4 +149,4 @@ unset VAULT_ADDR VAULT_TOKEN KEYS_DIR PASSPHRASE
 
 This project is licensed under the Apache License, Version 2.0. See the `LICENSE` file at the project root for the full text.
 
-Additionally a copy of the notice is included in this package under `keymanager/LICENSE`.
+````

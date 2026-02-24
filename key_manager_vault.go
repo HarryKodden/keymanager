@@ -1,15 +1,13 @@
 package keymanager
 
 import (
-	"crypto/ecdsa"
+	"context"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"strings"
 	"time"
 
@@ -34,7 +32,7 @@ func base64URLNoPad(b []byte) string {
 	return s
 }
 
-func (v *VaultKeyManager) GetJWKS() (map[string]interface{}, error) {
+func (v *VaultKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, error) {
 	secret, err := v.client.Logical().List(fmt.Sprintf("%s/keys", v.transitMount))
 	if err != nil {
 		return nil, err
@@ -72,30 +70,16 @@ func (v *VaultKeyManager) GetJWKS() (map[string]interface{}, error) {
 		if err != nil {
 			continue
 		}
-		switch pk := pubIfc.(type) {
-		case *ecdsa.PublicKey:
-			x := base64URLNoPad(pk.X.Bytes())
-			y := base64URLNoPad(pk.Y.Bytes())
-			kid := fmt.Sprintf("%s-%v", name, sec.Data["min_encryption_version"])
-			jwk := map[string]interface{}{
-				"kty": "EC",
-				"crv": "P-256",
-				"kid": kid,
-				"use": "sig",
-				"alg": "ES256",
-				"x":   x,
-				"y":   y,
-			}
+		kid := fmt.Sprintf("%s-%v", name, sec.Data["min_encryption_version"])
+		if jwk, err := jwkFromPublicKey(kid, pubIfc, ""); err == nil {
 			jwkKeys = append(jwkKeys, jwk)
-		default:
-			continue
 		}
 	}
 
 	return map[string]interface{}{"keys": jwkKeys}, nil
 }
 
-func (v *VaultKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
+func (v *VaultKeyManager) Sign(ctx context.Context, kid string, payload []byte) ([]byte, error) {
 	log.Printf("[KEYMANAGER][VAULT] Sign requested for kid=%s", kid)
 	name := kid
 	if idx := strings.Index(kid, "-"); idx != -1 {
@@ -121,21 +105,16 @@ func (v *VaultKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode vault signature: %w", err)
 	}
-	var esig struct{ R, S *big.Int }
-	if _, err := asn1.Unmarshal(der, &esig); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal ecdsa signature: %w", err)
+	// convert DER ECDSA signature to raw r||s
+	sig, err := ECDSADERToRaw(der, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert ecdsa der->raw: %w", err)
 	}
-	keyBytes := 32
-	rb := esig.R.Bytes()
-	sb := esig.S.Bytes()
-	sig := make([]byte, keyBytes*2)
-	copy(sig[keyBytes-len(rb):keyBytes], rb)
-	copy(sig[2*keyBytes-len(sb):], sb)
 	log.Printf("[KEYMANAGER][VAULT] Sign completed for kid=%s via vault key=%s", kid, name)
 	return sig, nil
 }
 
-func (v *VaultKeyManager) GenerateKey(name string, kty string, alg string) (*KeyMetadata, error) {
+func (v *VaultKeyManager) GenerateKey(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
 	vtype := "ecdsa-p256"
 	if strings.EqualFold(kty, "RSA") {
 		vtype = "rsa-2048"
@@ -155,7 +134,7 @@ func (v *VaultKeyManager) GenerateKey(name string, kty string, alg string) (*Key
 	return &KeyMetadata{Kid: name, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}, nil
 }
 
-func (v *VaultKeyManager) RotateKey(name string) (*KeyMetadata, error) {
+func (v *VaultKeyManager) RotateKey(ctx context.Context, name string) (*KeyMetadata, error) {
 	_, err := v.client.Logical().Write(fmt.Sprintf("%s/keys/%s/rotate", v.transitMount, name), nil)
 	if err != nil {
 		return nil, err
@@ -164,7 +143,7 @@ func (v *VaultKeyManager) RotateKey(name string) (*KeyMetadata, error) {
 	return &KeyMetadata{Kid: name, Status: KeyStatusActive, CreatedAt: time.Now().UTC()}, nil
 }
 
-func (v *VaultKeyManager) ListKeys() ([]*KeyMetadata, error) {
+func (v *VaultKeyManager) ListKeys(ctx context.Context) ([]*KeyMetadata, error) {
 	secret, err := v.client.Logical().List(fmt.Sprintf("%s/keys", v.transitMount))
 	if err != nil {
 		return nil, err
@@ -185,7 +164,7 @@ func (v *VaultKeyManager) ListKeys() ([]*KeyMetadata, error) {
 	return out, nil
 }
 
-func (v *VaultKeyManager) RevokeKey(kid string) error {
+func (v *VaultKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	name := kid
 	if idx := strings.Index(kid, "-"); idx != -1 {
 		name = kid[:idx]
@@ -205,18 +184,57 @@ func (v *VaultKeyManager) debugDump(i interface{}) string {
 	return string(b)
 }
 
-func (v *VaultKeyManager) LoadKeys() error { return nil }
+func (v *VaultKeyManager) LoadKeys(ctx context.Context) error { return nil }
 
-func (v *VaultKeyManager) GetSigningKey(kid string) (interface{}, error) {
+func (v *VaultKeyManager) GetSigningKey(ctx context.Context, kid string) (interface{}, error) {
 	name := kid
 	if idx := strings.Index(kid, "-"); idx != -1 {
 		name = kid[:idx]
 	}
 	log.Printf("[KEYMANAGER][VAULT] GetSigningKey lookup for kid=%s -> vault name=%s", kid, name)
+	sec, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.transitMount, name))
+	if err != nil {
+		return nil, err
+	}
+	if sec == nil || sec.Data == nil {
+		return nil, ErrKeyNotFound
+	}
+	minVer := sec.Data["min_encryption_version"]
+	expectedKid := fmt.Sprintf("%s-%v", name, minVer)
+	if expectedKid != kid {
+		return nil, ErrKeyNotActive
+	}
 	return name, nil
 }
 
-func (v *VaultKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
+func (v *VaultKeyManager) ActivateKey(ctx context.Context, kid string) error {
+	name := kid
+	if idx := strings.Index(kid, "-"); idx != -1 {
+		name = kid[:idx]
+	}
+	// rotate to create an active version
+	_, err := v.RotateKey(ctx, name)
+	return err
+}
+
+func (v *VaultKeyManager) DeactivateKey(ctx context.Context, kid string) error {
+	// Vault transit doesn't provide a simple "deactivate" API; document as unsupported
+	return ErrUnsupportedOperation
+}
+
+func (v *VaultKeyManager) GenerateAndActivate(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
+	md, err := v.GenerateKey(ctx, name, kty, alg)
+	if err != nil {
+		return nil, err
+	}
+	// Activate by rotating/creating an active version
+	if err := v.ActivateKey(ctx, md.Kid); err != nil {
+		return nil, err
+	}
+	return md, nil
+}
+
+func (v *VaultKeyManager) SignKeyAnnouncement(ctx context.Context, newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
 	log.Printf("[KEYMANAGER][VAULT] signing key announcement oldKid=%s", oldKid)
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()
@@ -232,7 +250,7 @@ func (v *VaultKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, old
 	hdrEnc := base64URLNoPad(hb)
 	pldEnc := base64URLNoPad(pb)
 	signingInput := fmt.Sprintf("%s.%s", hdrEnc, pldEnc)
-	sig, err := v.Sign(oldKid, []byte(signingInput))
+	sig, err := v.Sign(ctx, oldKid, []byte(signingInput))
 	if err != nil {
 		return "", fmt.Errorf("failed to sign announcement via Vault: %w", err)
 	}
@@ -240,7 +258,7 @@ func (v *VaultKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, old
 	return fmt.Sprintf("%s.%s", signingInput, sigEnc), nil
 }
 
-func (v *VaultKeyManager) ImportKey(name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
+func (v *VaultKeyManager) ImportKey(ctx context.Context, name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
 	log.Printf("[KEYMANAGER][VAULT] ImportKey not implemented for VaultKeyManager")
 	return nil, fmt.Errorf("ImportKey not implemented for VaultKeyManager")
 }

@@ -1,11 +1,11 @@
 package keymanager
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -26,7 +26,7 @@ type FileKeyManager struct {
 	dir        string
 	passphrase string
 	mu         sync.RWMutex
-	keys       map[string]*ecdsa.PrivateKey
+	keys       map[string]interface{}
 	meta       map[string]*KeyMetadata
 }
 
@@ -36,7 +36,7 @@ func NewFileKeyManager(dir string, passphrase string) *FileKeyManager {
 	}
 	log.Printf("[KEYMANAGER][FILE] loading keys from %s", dir)
 
-	return &FileKeyManager{dir: dir, passphrase: passphrase, keys: make(map[string]*ecdsa.PrivateKey), meta: make(map[string]*KeyMetadata)}
+	return &FileKeyManager{dir: dir, passphrase: passphrase, keys: make(map[string]interface{}), meta: make(map[string]*KeyMetadata)}
 }
 
 type fileKeyBlob struct {
@@ -54,7 +54,7 @@ func deriveKey(pass string) []byte {
 	return h[:]
 }
 
-func (f *FileKeyManager) LoadKeys() error {
+func (f *FileKeyManager) LoadKeys(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	files, err := ioutil.ReadDir(f.dir)
@@ -101,23 +101,33 @@ func (f *FileKeyManager) LoadKeys() error {
 		if err != nil {
 			continue
 		}
-		priv, err := x509.ParseECPrivateKey(plain)
-		if err != nil {
+		var privIfc interface{}
+		// Try PKCS#8 first, then fall back to PKCS#1 or EC private key formats
+		if p, err := x509.ParsePKCS8PrivateKey(plain); err == nil {
+			privIfc = p
+		} else if p, err := x509.ParsePKCS1PrivateKey(plain); err == nil {
+			privIfc = p
+		} else if p, err := x509.ParseECPrivateKey(plain); err == nil {
+			privIfc = p
+		} else {
 			continue
 		}
-		f.keys[blob.Kid] = priv
+		f.keys[blob.Kid] = privIfc
 		f.meta[blob.Kid] = &KeyMetadata{Kid: blob.Kid, Kty: blob.Kty, Alg: blob.Alg, Status: blob.Status, CreatedAt: blob.CreatedAt}
 	}
 	return nil
 }
 
-func (f *FileKeyManager) saveKeyToDisk(kid string, priv *ecdsa.PrivateKey, meta *KeyMetadata) error {
+func (f *FileKeyManager) saveKeyToDisk(kid string, priv interface{}, meta *KeyMetadata) error {
 	if err := os.MkdirAll(f.dir, 0700); err != nil {
 		return err
 	}
-	der, err := x509.MarshalECPrivateKey(priv)
+	var der []byte
+	var err error
+	// Marshal to PKCS#8 for compatibility across key types
+	der, err = x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal private key to PKCS#8: %w", err)
 	}
 	key := deriveKey(f.passphrase)
 	block, err := aes.NewCipher(key)
@@ -146,78 +156,96 @@ func (f *FileKeyManager) saveKeyToDisk(kid string, priv *ecdsa.PrivateKey, meta 
 	return nil
 }
 
-func (f *FileKeyManager) GetSigningKey(kid string) (interface{}, error) {
+func (f *FileKeyManager) GetSigningKey(ctx context.Context, kid string) (interface{}, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if k, ok := f.keys[kid]; ok {
-		return k, nil
+	if md, ok := f.meta[kid]; ok {
+		if md.Status != KeyStatusActive {
+			return nil, ErrKeyNotActive
+		}
+		if k, ok := f.keys[kid]; ok {
+			return k, nil
+		}
 	}
-	return nil, fmt.Errorf("key %s not found", kid)
+	return nil, ErrKeyNotFound
 }
 
-func (f *FileKeyManager) GetJWKS() (map[string]interface{}, error) {
+func (f *FileKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	keys := []interface{}{}
-	for kid, pk := range f.keys {
-		x := base64.RawURLEncoding.EncodeToString(pk.PublicKey.X.Bytes())
-		y := base64.RawURLEncoding.EncodeToString(pk.PublicKey.Y.Bytes())
-		keys = append(keys, map[string]interface{}{"kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256", "x": x, "y": y})
-	}
-	return map[string]interface{}{"keys": keys}, nil
-}
-
-func (f *FileKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
-	f.mu.RLock()
-	priv, ok := f.keys[kid]
-	f.mu.RUnlock()
-	if !ok {
-		log.Printf("[KEYMANAGER][FILE] Sign: key not found %s", kid)
-		return nil, fmt.Errorf("key %s not found", kid)
-	}
-	h := sha256.Sum256(payload)
-	r, s, err := ecdsa.Sign(rand.Reader, priv, h[:])
+	jwks, err := JWKSFromPrivateKeyMap(f.keys)
 	if err != nil {
 		return nil, err
 	}
-	rb := r.Bytes()
-	sb := s.Bytes()
-	sig := make([]byte, 64)
-	copy(sig[32-len(rb):32], rb)
-	copy(sig[64-len(sb):], sb)
-	log.Printf("[KEYMANAGER][FILE] signing with key %s", kid)
+	return jwks, nil
+}
+
+func (f *FileKeyManager) Sign(ctx context.Context, kid string, payload []byte) ([]byte, error) {
+	log.Printf("[KEYMANAGER][FILE] Sign requested using kid=%s", kid)
+	si, err := f.GetSigningKey(ctx, kid)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := SignPayload(si, payload)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[KEYMANAGER][FILE] Sign completed for kid=%s", kid)
 	return sig, nil
 }
 
-func (f *FileKeyManager) GenerateKey(name string, kty string, alg string) (*KeyMetadata, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func (f *FileKeyManager) GenerateKey(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
+	var privIfc interface{}
+	var err error
+	if kty == "" {
+		privIfc, err = GeneratePrivateKey("", 0)
+	} else {
+		privIfc, err = GeneratePrivateKey(kty, 0)
+	}
 	if err != nil {
 		return nil, err
 	}
+	if alg == "" {
+		if strings.EqualFold(kty, "RSA") {
+			alg = "RS256"
+		} else {
+			alg = "ES256"
+		}
+	}
 	kid := fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405Z"))
 	if kty == "" {
-		kty = "EC"
+		switch privIfc.(type) {
+		case *rsa.PrivateKey:
+			kty = "RSA"
+		default:
+			kty = "EC"
+		}
 	}
 	if alg == "" {
-		alg = "ES256"
+		if kty == "RSA" {
+			alg = "RS256"
+		} else {
+			alg = "ES256"
+		}
 	}
 	meta := &KeyMetadata{Kid: kid, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
 	f.mu.Lock()
-	f.keys[kid] = priv
+	f.keys[kid] = privIfc
 	f.meta[kid] = meta
 	f.mu.Unlock()
-	if err := f.saveKeyToDisk(kid, priv, meta); err != nil {
+	// persist
+	if err := f.saveKeyToDisk(kid, privIfc, meta); err != nil {
 		return nil, err
 	}
 	log.Printf("[KEYMANAGER][FILE] generated key %s (kty=%s alg=%s)", kid, kty, alg)
 	return meta, nil
 }
 
-func (f *FileKeyManager) RotateKey(name string) (*KeyMetadata, error) {
-	return f.GenerateKey(name, "EC", "ES256")
+func (f *FileKeyManager) RotateKey(ctx context.Context, name string) (*KeyMetadata, error) {
+	return f.GenerateKey(ctx, name, "EC", "ES256")
 }
 
-func (f *FileKeyManager) ListKeys() ([]*KeyMetadata, error) {
+func (f *FileKeyManager) ListKeys(ctx context.Context) ([]*KeyMetadata, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	out := []*KeyMetadata{}
@@ -228,7 +256,7 @@ func (f *FileKeyManager) ListKeys() ([]*KeyMetadata, error) {
 	return out, nil
 }
 
-func (f *FileKeyManager) RevokeKey(kid string) error {
+func (f *FileKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if md, ok := f.meta[kid]; ok {
@@ -241,7 +269,7 @@ func (f *FileKeyManager) RevokeKey(kid string) error {
 	return fmt.Errorf("unknown key %s", kid)
 }
 
-func (f *FileKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
+func (f *FileKeyManager) SignKeyAnnouncement(ctx context.Context, newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()
 	payload := map[string]interface{}{"iss": iss, "iat": now.Unix(), "exp": now.Add(exp).Unix(), "jwks": map[string]interface{}{"keys": []interface{}{newJWK}}}
@@ -256,7 +284,7 @@ func (f *FileKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldK
 	hdrEnc := base64.RawURLEncoding.EncodeToString(hb)
 	pldEnc := base64.RawURLEncoding.EncodeToString(pb)
 	signingInput := hdrEnc + "." + pldEnc
-	sig, err := f.Sign(oldKid, []byte(signingInput))
+	sig, err := f.Sign(ctx, oldKid, []byte(signingInput))
 	if err != nil {
 		return "", err
 	}
@@ -264,23 +292,96 @@ func (f *FileKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldK
 	return signingInput + "." + sigEnc, nil
 }
 
-func (f *FileKeyManager) ImportKey(name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
+func (f *FileKeyManager) ImportKey(ctx context.Context, name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
 	block, _ := pem.Decode(pemEncoded)
 	if block == nil {
 		return nil, fmt.Errorf("failed to decode PEM")
 	}
-	priv, err := x509.ParseECPrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse EC private key: %w", err)
+	var privIfc interface{}
+	var kty string
+	// Try PKCS#8 (PRIVATE KEY) first, then fall back to RSA/EC specific formats
+	if p, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		privIfc = p
+		switch p.(type) {
+		case *rsa.PrivateKey:
+			kty = "RSA"
+		default:
+			kty = "EC"
+		}
+	} else if strings.Contains(block.Type, "RSA") {
+		p, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse RSA private key: %w", err)
+		}
+		privIfc = p
+		kty = "RSA"
+	} else {
+		p, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse EC private key: %w", err)
+		}
+		privIfc = p
+		kty = "EC"
 	}
 	kid := fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405Z"))
-	meta := &KeyMetadata{Kid: kid, Kty: "EC", Alg: "ES256", Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
+	alg := ""
+	if kty == "RSA" {
+		alg = "RS256"
+	} else {
+		alg = "ES256"
+	}
+	meta := &KeyMetadata{Kid: kid, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
 	f.mu.Lock()
-	f.keys[kid] = priv
+	f.keys[kid] = privIfc
 	f.meta[kid] = meta
 	f.mu.Unlock()
-	if err := f.saveKeyToDisk(kid, priv, meta); err != nil {
+	if err := f.saveKeyToDisk(kid, privIfc, meta); err != nil {
 		return nil, err
 	}
 	return meta, nil
+}
+
+func (f *FileKeyManager) ActivateKey(ctx context.Context, kid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	md, ok := f.meta[kid]
+	if !ok {
+		return ErrKeyNotFound
+	}
+	md.Status = KeyStatusActive
+	if priv, ok2 := f.keys[kid]; ok2 {
+		if err := f.saveKeyToDisk(kid, priv, md); err != nil {
+			return err
+		}
+	}
+	log.Printf("[KEYMANAGER][FILE] activated key %s", kid)
+	return nil
+}
+
+func (f *FileKeyManager) DeactivateKey(ctx context.Context, kid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	md, ok := f.meta[kid]
+	if !ok {
+		return ErrKeyNotFound
+	}
+	md.Status = KeyStatusStandby
+	if priv, ok2 := f.keys[kid]; ok2 {
+		if err := f.saveKeyToDisk(kid, priv, md); err != nil {
+			return err
+		}
+	}
+	log.Printf("[KEYMANAGER][FILE] deactivated key %s", kid)
+	return nil
+}
+
+func (f *FileKeyManager) GenerateAndActivate(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
+	md, err := f.GenerateKey(ctx, name, kty, alg)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.ActivateKey(ctx, md.Kid); err != nil {
+		return nil, err
+	}
+	return md, nil
 }

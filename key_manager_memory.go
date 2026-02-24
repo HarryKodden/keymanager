@@ -1,10 +1,8 @@
 package keymanager
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
+	"context"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -15,89 +13,133 @@ import (
 
 // MemoryKeyManager is a simple in-memory KeyManager (ephemeral)
 type MemoryKeyManager struct {
-	keys map[string]*ecdsa.PrivateKey
+	keys map[string]interface{}
 	meta map[string]*KeyMetadata
 	mu   sync.RWMutex
 }
 
 func NewMemoryKeyManager() *MemoryKeyManager {
 	log.Printf("[KEYMANAGER][MEMORY] initialized ephemeral memory key manager")
-	return &MemoryKeyManager{keys: make(map[string]*ecdsa.PrivateKey), meta: make(map[string]*KeyMetadata)}
+	return &MemoryKeyManager{keys: make(map[string]interface{}), meta: make(map[string]*KeyMetadata)}
 }
 
-func (m *MemoryKeyManager) LoadKeys() error { return nil }
+func (m *MemoryKeyManager) LoadKeys(ctx context.Context) error { return nil }
 
-func (m *MemoryKeyManager) GetSigningKey(kid string) (interface{}, error) {
+func (m *MemoryKeyManager) GetSigningKey(ctx context.Context, kid string) (interface{}, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if k, ok := m.keys[kid]; ok {
-		return k, nil
+	if md, ok := m.meta[kid]; ok {
+		if md.Status != KeyStatusActive {
+			log.Printf("[KEYMANAGER][MEMORY] signing key not active: %s status=%s", kid, md.Status)
+			return nil, ErrKeyNotActive
+		}
+		if k, ok := m.keys[kid]; ok {
+			return k, nil
+		}
 	}
 	log.Printf("[KEYMANAGER][MEMORY] signing key not found: %s", kid)
-	return nil, fmt.Errorf("signing key %s not found", kid)
+	return nil, ErrKeyNotFound
 }
 
-func (m *MemoryKeyManager) GetJWKS() (map[string]interface{}, error) {
+func (m *MemoryKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	keys := []interface{}{}
-	for kid, pk := range m.keys {
-		x := base64.RawURLEncoding.EncodeToString(pk.PublicKey.X.Bytes())
-		y := base64.RawURLEncoding.EncodeToString(pk.PublicKey.Y.Bytes())
-		keys = append(keys, map[string]interface{}{"kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256", "x": x, "y": y})
-	}
-	log.Printf("[KEYMANAGER][MEMORY] returning JWKS with %d keys", len(keys))
-	return map[string]interface{}{"keys": keys}, nil
-}
-
-func (m *MemoryKeyManager) Sign(kid string, payload []byte) ([]byte, error) {
-	m.mu.RLock()
-	k, ok := m.keys[kid]
-	m.mu.RUnlock()
-	log.Printf("[KEYMANAGER][MEMORY] Sign requested using kid=%s", kid)
-	if !ok {
-		log.Printf("[KEYMANAGER][MEMORY] Sign: key not found %s", kid)
-		return nil, fmt.Errorf("key %s not found", kid)
-	}
-	h := sha256.Sum256(payload)
-	r, s, err := ecdsa.Sign(rand.Reader, k, h[:])
+	jwks, err := JWKSFromPrivateKeyMap(m.keys)
 	if err != nil {
 		return nil, err
 	}
-	rb := r.Bytes()
-	sb := s.Bytes()
-	sig := make([]byte, 64)
-	copy(sig[32-len(rb):32], rb)
-	copy(sig[64-len(sb):], sb)
+	log.Printf("[KEYMANAGER][MEMORY] returning JWKS with %d keys", len(jwks["keys"].([]interface{})))
+	return jwks, nil
+}
+
+func (m *MemoryKeyManager) Sign(ctx context.Context, kid string, payload []byte) ([]byte, error) {
+	log.Printf("[KEYMANAGER][MEMORY] Sign requested using kid=%s", kid)
+	si, err := m.GetSigningKey(ctx, kid)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := SignPayload(si, payload)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[KEYMANAGER][MEMORY] Sign completed for kid=%s", kid)
 	return sig, nil
 }
 
-func (m *MemoryKeyManager) GenerateKey(name string, kty string, alg string) (*KeyMetadata, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func (m *MemoryKeyManager) GenerateKey(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
+	var privIfc interface{}
+	var err error
+	if kty == "" {
+		privIfc, err = GeneratePrivateKey("", 0)
+	} else {
+		privIfc, err = GeneratePrivateKey(kty, 0)
+	}
 	if err != nil {
 		return nil, err
 	}
 	kid := fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405Z"))
 	if kty == "" {
-		kty = "EC"
+		// choose default based on generated key
+		switch privIfc.(type) {
+		case *rsa.PrivateKey:
+			kty = "RSA"
+		default:
+			kty = "EC"
+		}
 	}
 	if alg == "" {
-		alg = "ES256"
+		if kty == "RSA" {
+			alg = "RS256"
+		} else {
+			alg = "ES256"
+		}
 	}
 	m.mu.Lock()
-	m.keys[kid] = priv
+	m.keys[kid] = privIfc
 	m.meta[kid] = &KeyMetadata{Kid: kid, Kty: kty, Alg: alg, Status: KeyStatusStandby, CreatedAt: time.Now().UTC()}
 	m.mu.Unlock()
 	log.Printf("[KEYMANAGER][MEMORY] generated key %s (kty=%s alg=%s)", kid, kty, alg)
 	return m.meta[kid], nil
 }
 
-func (m *MemoryKeyManager) RotateKey(name string) (*KeyMetadata, error) {
-	return m.GenerateKey(name, "EC", "ES256")
+func (m *MemoryKeyManager) ActivateKey(ctx context.Context, kid string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if md, ok := m.meta[kid]; ok {
+		md.Status = KeyStatusActive
+		log.Printf("[KEYMANAGER][MEMORY] activated key %s", kid)
+		return nil
+	}
+	return ErrKeyNotFound
 }
 
-func (m *MemoryKeyManager) ListKeys() ([]*KeyMetadata, error) {
+func (m *MemoryKeyManager) DeactivateKey(ctx context.Context, kid string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if md, ok := m.meta[kid]; ok {
+		md.Status = KeyStatusStandby
+		log.Printf("[KEYMANAGER][MEMORY] deactivated key %s", kid)
+		return nil
+	}
+	return ErrKeyNotFound
+}
+
+func (m *MemoryKeyManager) GenerateAndActivate(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
+	md, err := m.GenerateKey(ctx, name, kty, alg)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ActivateKey(ctx, md.Kid); err != nil {
+		return nil, err
+	}
+	return md, nil
+}
+
+func (m *MemoryKeyManager) RotateKey(ctx context.Context, name string) (*KeyMetadata, error) {
+	return m.GenerateKey(ctx, name, "EC", "ES256")
+}
+
+func (m *MemoryKeyManager) ListKeys(ctx context.Context) ([]*KeyMetadata, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := []*KeyMetadata{}
@@ -108,7 +150,7 @@ func (m *MemoryKeyManager) ListKeys() ([]*KeyMetadata, error) {
 	return out, nil
 }
 
-func (m *MemoryKeyManager) RevokeKey(kid string) error {
+func (m *MemoryKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if md, ok := m.meta[kid]; ok {
@@ -120,7 +162,7 @@ func (m *MemoryKeyManager) RevokeKey(kid string) error {
 	return fmt.Errorf("unknown key %s", kid)
 }
 
-func (m *MemoryKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
+func (m *MemoryKeyManager) SignKeyAnnouncement(ctx context.Context, newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
 	log.Printf("[KEYMANAGER][MEMORY] signing key announcement oldKid=%s", oldKid)
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()
@@ -130,7 +172,7 @@ func (m *MemoryKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, ol
 	hdrEnc := base64.RawURLEncoding.EncodeToString(hb)
 	pldEnc := base64.RawURLEncoding.EncodeToString(pb)
 	signingInput := hdrEnc + "." + pldEnc
-	sig, err := m.Sign(oldKid, []byte(signingInput))
+	sig, err := m.Sign(ctx, oldKid, []byte(signingInput))
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +180,7 @@ func (m *MemoryKeyManager) SignKeyAnnouncement(newJWK map[string]interface{}, ol
 	return signingInput + "." + sigEnc, nil
 }
 
-func (m *MemoryKeyManager) ImportKey(name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
+func (m *MemoryKeyManager) ImportKey(ctx context.Context, name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error) {
 	log.Printf("[KEYMANAGER][MEMORY] ImportKey not implemented for MemoryKeyManager")
 	return nil, fmt.Errorf("ImportKey not implemented for MemoryKeyManager")
 }
