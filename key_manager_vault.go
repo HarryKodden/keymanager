@@ -2,12 +2,14 @@ package keymanager
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,21 +60,48 @@ func (v *VaultKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, 
 		if err != nil || sec == nil || sec.Data == nil {
 			continue
 		}
-		pubRaw, _ := sec.Data["public_key"].(string)
-		if pubRaw == "" {
-			continue
+		// Vault returns public keys nested under sec.Data["keys"][version].public_key
+		if keysRaw, ok := sec.Data["keys"].(map[string]interface{}); ok {
+			for ver, ventry := range keysRaw {
+				if entryMap, ok := ventry.(map[string]interface{}); ok {
+					pubRaw, _ := entryMap["public_key"].(string)
+					if pubRaw == "" {
+						continue
+					}
+					block, _ := pem.Decode([]byte(pubRaw))
+					if block == nil {
+						continue
+					}
+					pubIfc, err := x509.ParsePKIXPublicKey(block.Bytes)
+					if err != nil {
+						continue
+					}
+					kid := fmt.Sprintf("%s-%s", name, ver)
+					if jwk, err := jwkFromPublicKey(kid, pubIfc, ""); err == nil {
+						jwkKeys = append(jwkKeys, jwk)
+					}
+				}
+			}
 		}
-		block, _ := pem.Decode([]byte(pubRaw))
-		if block == nil {
-			continue
-		}
-		pubIfc, err := x509.ParsePKIXPublicKey(block.Bytes)
-		if err != nil {
-			continue
-		}
-		kid := fmt.Sprintf("%s-%v", name, sec.Data["min_encryption_version"])
-		if jwk, err := jwkFromPublicKey(kid, pubIfc, ""); err == nil {
-			jwkKeys = append(jwkKeys, jwk)
+		// fall back: some Vault versions may expose public_key at top-level
+		if pubRaw, _ := sec.Data["public_key"].(string); pubRaw != "" {
+			block, _ := pem.Decode([]byte(pubRaw))
+			if block != nil {
+				if pubIfc, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+					// try to derive a reasonable kid using latest_version if present
+					if lv, ok := sec.Data["latest_version"]; ok {
+						kid := fmt.Sprintf("%s-%v", name, lv)
+						if jwk, err := jwkFromPublicKey(kid, pubIfc, ""); err == nil {
+							jwkKeys = append(jwkKeys, jwk)
+						}
+					} else {
+						kid := name
+						if jwk, err := jwkFromPublicKey(kid, pubIfc, ""); err == nil {
+							jwkKeys = append(jwkKeys, jwk)
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -81,21 +110,41 @@ func (v *VaultKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, 
 
 func (v *VaultKeyManager) Sign(ctx context.Context, kid string, payload []byte) ([]byte, error) {
 	log.Printf("[KEYMANAGER][VAULT] Sign requested for kid=%s", kid)
-	name := kid
-	if idx := strings.Index(kid, "-"); idx != -1 {
-		name = kid[:idx]
-	}
-	input := base64.StdEncoding.EncodeToString(payload)
-	data := map[string]interface{}{"input": input}
-	path := fmt.Sprintf("%s/sign/%s", v.transitMount, name)
-	sec, err := v.client.Logical().Write(path, data)
+	name, sec, err := v.resolveVaultName(kid)
 	if err != nil {
 		return nil, err
 	}
-	if sec == nil || sec.Data == nil {
+	// Vault transit expects the `input` to be the raw bytes to sign encoded
+	// in base64; to match local signing (which hashes the input first), send
+	// the SHA-256 digest of the payload so Vault signs the digest directly.
+	h := sha256.Sum256(payload)
+	input := base64.StdEncoding.EncodeToString(h[:])
+	// mark the input as already hashed so Vault won't hash it again
+	data := map[string]interface{}{"input": input, "prehashed": true}
+	// If kid includes a numeric version suffix (name-<ver>), request that exact
+	// key version from Vault to ensure the signature matches the JWKS entry.
+	if idx := strings.LastIndex(kid, "-"); idx != -1 && idx+1 < len(kid) {
+		suffix := kid[idx+1:]
+		if ver, verr := strconv.Atoi(suffix); verr == nil {
+			// Only request a specific key_version if the key metadata contains that version
+			if sec != nil && sec.Data != nil {
+				if keysRaw, ok := sec.Data["keys"].(map[string]interface{}); ok {
+					if _, ok2 := keysRaw[suffix]; ok2 {
+						data["key_version"] = ver
+					}
+				}
+			}
+		}
+	}
+	path := fmt.Sprintf("%s/sign/%s", v.transitMount, name)
+	resp, err := v.client.Logical().Write(path, data)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || resp.Data == nil {
 		return nil, fmt.Errorf("no signature returned from vault")
 	}
-	sigStr, _ := sec.Data["signature"].(string)
+	sigStr, _ := resp.Data["signature"].(string)
 	parts := strings.Split(sigStr, ":")
 	if len(parts) < 3 {
 		return nil, fmt.Errorf("unexpected signature format from vault: %s", sigStr)
@@ -123,7 +172,8 @@ func (v *VaultKeyManager) GenerateKey(ctx context.Context, name string, kty stri
 	if strings.EqualFold(kty, "RSA") {
 		vtype = "rsa-2048"
 	}
-	data := map[string]interface{}{"type": vtype}
+	// request exportable public key so Vault returns `public_key` in the key metadata
+	data := map[string]interface{}{"type": vtype, "exportable": true}
 	_, err := v.client.Logical().Write(fmt.Sprintf("%s/keys/%s", v.transitMount, name), data)
 	if err != nil {
 		return nil, err
@@ -169,9 +219,9 @@ func (v *VaultKeyManager) ListKeys(ctx context.Context) ([]*KeyMetadata, error) 
 }
 
 func (v *VaultKeyManager) RevokeKey(ctx context.Context, kid string) error {
-	name := kid
-	if idx := strings.Index(kid, "-"); idx != -1 {
-		name = kid[:idx]
+	name, _, err := v.resolveVaultName(kid)
+	if err != nil {
+		return err
 	}
 	log.Printf("[KEYMANAGER][VAULT] revoking key %s (vault name=%s)", kid, name)
 	cfgPath := fmt.Sprintf("%s/keys/%s/config", v.transitMount, name)
@@ -191,34 +241,88 @@ func (v *VaultKeyManager) debugDump(i interface{}) string {
 func (v *VaultKeyManager) LoadKeys(ctx context.Context) error { return nil }
 
 func (v *VaultKeyManager) GetSigningKey(ctx context.Context, kid string) (interface{}, error) {
-	name := kid
-	if idx := strings.Index(kid, "-"); idx != -1 {
-		name = kid[:idx]
-	}
+	name, sec, err := v.resolveVaultName(kid)
 	log.Printf("[KEYMANAGER][VAULT] GetSigningKey lookup for kid=%s -> vault name=%s", kid, name)
-	sec, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.transitMount, name))
 	if err != nil {
 		return nil, err
 	}
 	if sec == nil || sec.Data == nil {
 		return nil, ErrKeyNotFound
 	}
-	minVer := sec.Data["min_encryption_version"]
-	expectedKid := fmt.Sprintf("%s-%v", name, minVer)
-	if expectedKid != kid {
-		return nil, ErrKeyNotActive
+	// If the kid includes a numeric version suffix (name-<ver>), ensure that
+	// version exists in the key metadata. Otherwise, return the base name
+	// if signing is supported for this key.
+	if idx := strings.LastIndex(kid, "-"); idx != -1 && idx+1 < len(kid) {
+		suffix := kid[idx+1:]
+		if _, verr := strconv.Atoi(suffix); verr == nil {
+			if keysRaw, ok := sec.Data["keys"].(map[string]interface{}); ok {
+				if _, ok2 := keysRaw[suffix]; ok2 {
+					return name, nil
+				}
+			}
+			return nil, ErrKeyNotActive
+		}
 	}
-	return name, nil
+	// No explicit version requested; accept name if signing supported
+	if sup, ok := sec.Data["supports_signing"].(bool); ok && sup {
+		return name, nil
+	}
+	return nil, ErrKeyNotActive
 }
 
 func (v *VaultKeyManager) ActivateKey(ctx context.Context, kid string) error {
-	name := kid
-	if idx := strings.Index(kid, "-"); idx != -1 {
-		name = kid[:idx]
+	name, _, err := v.resolveVaultName(kid)
+	if err != nil {
+		return err
 	}
 	// rotate to create an active version
-	_, err := v.RotateKey(ctx, name)
+	_, err = v.RotateKey(ctx, name)
 	return err
+}
+
+// resolveVaultName attempts to find the actual vault key name for a given
+// `kid`. It first tries the exact `kid`; if not found and the `kid` ends
+// with a numeric suffix (e.g. "name-<version>"), it will try the base
+// name without the numeric suffix. Returns the resolved name and the
+// secret read from Vault (if found).
+func (v *VaultKeyManager) resolveVaultName(kid string) (string, *vault.Secret, error) {
+	// try exact
+	sec, err := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.transitMount, kid))
+	if err != nil {
+		return "", nil, err
+	}
+	if sec != nil && sec.Data != nil {
+		return kid, sec, nil
+	}
+	// try stripping a numeric suffix
+	if idx := strings.LastIndex(kid, "-"); idx != -1 && idx < len(kid)-1 {
+		suffix := kid[idx+1:]
+		if _, err := strconv.Atoi(suffix); err == nil {
+			alt := kid[:idx]
+			sec2, err2 := v.client.Logical().Read(fmt.Sprintf("%s/keys/%s", v.transitMount, alt))
+			if err2 != nil {
+				return "", nil, err2
+			}
+			if sec2 != nil && sec2.Data != nil {
+				return alt, sec2, nil
+			}
+		}
+	}
+	return kid, nil, nil
+}
+
+// stripVersionSuffix returns the base key name by removing a numeric
+// version suffix of the form "-<number>". If the suffix is not numeric
+// the original name is returned unchanged. This preserves key names that
+// legitimately contain hyphens.
+func stripVersionSuffix(name string) string {
+	if idx := strings.LastIndex(name, "-"); idx != -1 && idx < len(name)-1 {
+		suffix := name[idx+1:]
+		if _, err := strconv.Atoi(suffix); err == nil {
+			return name[:idx]
+		}
+	}
+	return name
 }
 
 func (v *VaultKeyManager) DeactivateKey(ctx context.Context, kid string) error {

@@ -22,7 +22,38 @@ Lightweight Go utilities for key management used by the OpenID Federation resolv
 - RSA support (generate, sign, JWKS) and configurable RSA size via `KEYMANAGER_RSA_BITS` (default: 2048).
 - File-backed key storage encrypts PKCS#8 blobs with AES-GCM derived from the provided passphrase.
 
+Public API methods that accept `context.Context` (examples):
+
+- `GetJWKS(ctx context.Context) (map[string]interface{}, error)`
+- `Sign(ctx context.Context, kid string, payload []byte) ([]byte, error)`
+- `GenerateKey(ctx context.Context, name, kty, alg string) (*KeyMetadata, error)`
+- `GenerateAndActivate(ctx context.Context, name, kty, alg string) (*KeyMetadata, error)`
+- `RotateKey(ctx context.Context, name string) (*KeyMetadata, error)`
+- `LoadKeys(ctx context.Context) error` *(AdvancedKeyManager)*
+- `GetSigningKey(ctx context.Context, kid string) (interface{}, error)` *(AdvancedKeyManager)*
+- `ListKeys(ctx context.Context) ([]*KeyMetadata, error)`
+- `RevokeKey(ctx context.Context, kid string) error`
+- `ImportKey(ctx context.Context, name string, pemEncoded []byte, passphrase string) (*KeyMetadata, error)` *(AdvancedKeyManager)*
+
+Note: `NewDefaultKeyManager()` is a context-free factory (it inspects environment variables and returns a `KeyManager`). Network-backed initialization (for Vault) is performed lazily (for example when calling `LoadKeys(ctx)`), so callers should pass an appropriate `context.Context` to those operations.
+
 ## Quick start
+
+// Cancellable context example (useful for Vault/network operations):
+```go
+import (
+    "context"
+    "time"
+)
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+km, err := keymanager.NewDefaultKeyManager()
+if err != nil {
+    // handle
+}
+_ = km.LoadKeys(ctx) // will abort if ctx times out
 
 Prefer using the factory which selects a backend based on environment variables:
 
@@ -85,6 +116,12 @@ _ = meta
 - `KEYMANAGER_RSA_BITS` — default RSA key size for generated RSA keys (e.g., `export KEYMANAGER_RSA_BITS=4096`).
 - `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_TRANSIT_MOUNT` — when set, `NewDefaultKeyManager()` will prefer Vault Transit.
 - `KEYS_DIR`, `PASSPHRASE` — used to enable `FileKeyManager` when Vault is not configured.
+
+Backend selection priority used by `NewDefaultKeyManager()`:
+
+1. Vault Transit (if `VAULT_ADDR` + `VAULT_TOKEN` are present)
+2. File-backed (`KEYS_DIR` + `PASSPHRASE`)
+3. In-memory fallback (ephemeral)
 
 ## Examples
 
