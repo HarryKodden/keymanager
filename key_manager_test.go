@@ -404,3 +404,90 @@ func TestECDSADERToRawZeroing(t *testing.T) {
 		}
 	}
 }
+
+func TestMemoryKeyManager_KeyStatus(t *testing.T) {
+	m := NewMemoryKeyManager()
+	ctx := context.Background()
+
+	md, err := m.GenerateKey(ctx, "test", "EC", "ES256")
+	if err != nil {
+		t.Fatalf("GenerateKey error: %v", err)
+	}
+
+	// newly generated key should be standby
+	st, err := m.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error: %v", err)
+	}
+	if st != KeyStatusStandby {
+		t.Fatalf("expected standby, got %v", st)
+	}
+
+	// activate and check
+	if err := m.ActivateKey(ctx, md.Kid); err != nil {
+		t.Fatalf("ActivateKey error: %v", err)
+	}
+	st, err = m.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error: %v", err)
+	}
+	if st != KeyStatusActive {
+		t.Fatalf("expected active, got %v", st)
+	}
+
+	// revoke and check
+	if err := m.RevokeKey(ctx, md.Kid); err != nil {
+		t.Fatalf("RevokeKey error: %v", err)
+	}
+	st, err = m.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error after revoke: %v", err)
+	}
+	if st != KeyStatusRetired {
+		t.Fatalf("expected retired, got %v", st)
+	}
+}
+
+func TestFileKeyManager_KeyStatus(t *testing.T) {
+	dir := t.TempDir()
+	f := NewFileKeyManager(dir, "passphrase")
+	ctx := context.Background()
+
+	md, err := f.GenerateKey(ctx, "filetest", "EC", "ES256")
+	if err != nil {
+		t.Fatalf("GenerateKey error: %v", err)
+	}
+
+	// newly generated key should be standby
+	st, err := f.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error: %v", err)
+	}
+	if st != KeyStatusStandby {
+		t.Fatalf("expected standby, got %v", st)
+	}
+
+	// activate and check
+	if err := f.ActivateKey(ctx, md.Kid); err != nil {
+		t.Fatalf("ActivateKey error: %v", err)
+	}
+	st, err = f.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error: %v", err)
+	}
+	if st != KeyStatusActive {
+		t.Fatalf("expected active, got %v", st)
+	}
+
+	// revoke and check
+	if err := f.RevokeKey(ctx, md.Kid); err != nil {
+		t.Fatalf("RevokeKey error: %v", err)
+	}
+	st, err = f.KeyStatus(ctx, md.Kid)
+	if err != nil {
+		t.Fatalf("KeyStatus error after revoke: %v", err)
+	}
+	if st != KeyStatusRetired {
+		t.Fatalf("expected retired, got %v", st)
+	}
+}

@@ -47,6 +47,7 @@ type KeyManager interface {
 	RotateKey(ctx context.Context, name string) (*KeyMetadata, error)
 	ListKeys(ctx context.Context) ([]*KeyMetadata, error)
 	RevokeKey(ctx context.Context, kid string) error
+	KeyStatus(ctx context.Context, kid string) (KeyStatus, error)
 }
 
 // AdvancedKeyManager extends KeyManager with higher-level operations used for

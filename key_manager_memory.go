@@ -166,6 +166,15 @@ func (m *MemoryKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	return fmt.Errorf("unknown key %s", kid)
 }
 
+func (m *MemoryKeyManager) KeyStatus(ctx context.Context, kid string) (KeyStatus, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if md, ok := m.meta[kid]; ok {
+		return md.Status, nil
+	}
+	return "", ErrKeyNotFound
+}
+
 func (m *MemoryKeyManager) SignKeyAnnouncement(ctx context.Context, newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
 	log.Printf("[KEYMANAGER][MEMORY] signing key announcement oldKid=%s", oldKid)
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}

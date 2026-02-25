@@ -307,6 +307,15 @@ func (f *FileKeyManager) RevokeKey(ctx context.Context, kid string) error {
 	return fmt.Errorf("unknown key %s", kid)
 }
 
+func (f *FileKeyManager) KeyStatus(ctx context.Context, kid string) (KeyStatus, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if md, ok := f.meta[kid]; ok {
+		return md.Status, nil
+	}
+	return "", ErrKeyNotFound
+}
+
 func (f *FileKeyManager) SignKeyAnnouncement(ctx context.Context, newJWK map[string]interface{}, oldKid string, iss string, exp time.Duration) (string, error) {
 	header := map[string]interface{}{"alg": "ES256", "kid": oldKid, "typ": "JWT"}
 	now := time.Now().UTC()

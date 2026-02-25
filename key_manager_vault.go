@@ -330,6 +330,22 @@ func (v *VaultKeyManager) DeactivateKey(ctx context.Context, kid string) error {
 	return ErrUnsupportedOperation
 }
 
+func (v *VaultKeyManager) KeyStatus(ctx context.Context, kid string) (KeyStatus, error) {
+	_, sec, err := v.resolveVaultName(kid)
+	if err != nil {
+		return "", err
+	}
+	if sec == nil || sec.Data == nil {
+		return "", ErrKeyNotFound
+	}
+	// If signing is supported, consider the Vault key active
+	if sup, ok := sec.Data["supports_signing"].(bool); ok && sup {
+		return KeyStatusActive, nil
+	}
+	// otherwise return standby
+	return KeyStatusStandby, nil
+}
+
 func (v *VaultKeyManager) GenerateAndActivate(ctx context.Context, name string, kty string, alg string) (*KeyMetadata, error) {
 	md, err := v.GenerateKey(ctx, name, kty, alg)
 	if err != nil {
