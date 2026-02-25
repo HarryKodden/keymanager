@@ -213,8 +213,10 @@ func (f *FileKeyManager) GetJWKS(ctx context.Context) (map[string]interface{}, e
 	defer f.mu.RUnlock()
 	jwks, err := JWKSFromPrivateKeyMap(f.keys)
 	if err != nil {
+		log.Printf("[KEYMANAGER][FILE] error generating JWKS: %v", err)
 		return nil, err
 	}
+	log.Printf("[KEYMANAGER][FILE] returning JWKS with %d keys", len(jwks["keys"].([]interface{})))
 	return jwks, nil
 }
 
